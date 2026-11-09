@@ -218,12 +218,7 @@ def validate_maple_onnx_bundle(bundle_path: str | Path) -> MapleBundleBuild:
                 )
             if entries[0].file_size > _MAX_MANIFEST_BYTES:
                 raise MapleBundleError(f"{MAPLE_BUNDLE_FILENAME} is too large")
-            try:
-                manifest = json.loads(archive.read(entries[0]).decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise MapleBundleError(
-                    f"{MAPLE_BUNDLE_FILENAME} must be valid UTF-8 JSON"
-                ) from exc
+            manifest = _load_manifest(archive, entries[0])
             _validate_manifest(manifest)
 
             declared = {item["path"]: item for item in manifest["files"]}
@@ -256,6 +251,49 @@ def validate_maple_onnx_bundle(bundle_path: str | Path) -> MapleBundleBuild:
     except zipfile.BadZipFile as exc:
         raise MapleBundleError("Maple bundle must be a valid ZIP archive") from exc
     return MapleBundleBuild(bundle_path=path, manifest=manifest)
+
+
+def _load_manifest(archive: zipfile.ZipFile, entry: zipfile.ZipInfo) -> Any:
+    """Decode the manifest, rejecting duplicate keys and non-finite numbers.
+
+    The size check in :func:`validate_maple_onnx_bundle` trusts the central
+    directory, so the payload is also capped while it is read. Messages never
+    echo archive paths or manifest values.
+    """
+
+    with archive.open(entry) as source:
+        payload = source.read(_MAX_MANIFEST_BYTES + 1)
+    if len(payload) > _MAX_MANIFEST_BYTES:
+        raise MapleBundleError(f"{MAPLE_BUNDLE_FILENAME} is too large")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MapleBundleError(
+            f"{MAPLE_BUNDLE_FILENAME} must be valid UTF-8 JSON"
+        ) from exc
+    try:
+        return json.loads(
+            text,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_object,
+        )
+    except ValueError as exc:
+        raise MapleBundleError(
+            f"{MAPLE_BUNDLE_FILENAME} must be unambiguous JSON"
+        ) from exc
+
+
+def _reject_json_constant(_value: str) -> Any:
+    raise ValueError("non-finite JSON constants are not accepted")
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object keys are not accepted")
+        result[key] = value
+    return result
 
 
 def _validate_manifest(manifest: Any) -> None:
