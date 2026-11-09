@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject a Maple ONNX bundle manifest with duplicated keys, `NaN`/`Infinity`
+  constants, an oversized payload, an unknown runtime, a non-hex checksum or a
+  short source revision instead of letting the last value win, with negative
+  controls for each case (#5083).
+
 - Reject missing, repeated, or unsupported content types on the local privacy
   proxy's chat routes before reading the request body (#5185).
 
