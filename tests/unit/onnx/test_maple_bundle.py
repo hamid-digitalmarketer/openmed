@@ -27,6 +27,39 @@ def _write_fake_export(root):
         (root / name).write_bytes(payload)
 
 
+def _rewrite_manifest(original_path, destination, rewrite):
+    """Copy a valid bundle, replacing the manifest text with ``rewrite`` output."""
+
+    with zipfile.ZipFile(original_path) as source:
+        original_manifest = source.read(MAPLE_BUNDLE_FILENAME).decode("utf-8")
+        payloads = [
+            (entry.filename, source.read(entry)) for entry in source.infolist()[1:]
+        ]
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_STORED) as output:
+        output.writestr(MAPLE_BUNDLE_FILENAME, rewrite(original_manifest))
+        for name, payload in payloads:
+            output.writestr(name, payload)
+    return destination
+
+
+def _mutate_manifest(original_path, destination, mutate):
+    """Copy a valid bundle after applying ``mutate`` to its decoded manifest."""
+
+    def rewrite(text):
+        manifest = json.loads(text)
+        mutate(manifest)
+        return json.dumps(manifest)
+
+    return _rewrite_manifest(original_path, destination, rewrite)
+
+
+def _valid_bundle(tmp_path):
+    source = tmp_path / "export"
+    source.mkdir()
+    _write_fake_export(source)
+    return build_maple_onnx_bundle(source, tmp_path / "maple.zip")
+
+
 def test_builds_android_bundle_with_manifest_first_and_exact_integrity(tmp_path):
     source = tmp_path / "export"
     source.mkdir()
@@ -153,3 +186,87 @@ def test_rejects_undeclared_archive_entry(tmp_path):
 
     with pytest.raises(MapleBundleError, match="exactly match"):
         validate_maple_onnx_bundle(invalid)
+
+
+def test_rejects_duplicate_manifest_key(tmp_path):
+    original = _valid_bundle(tmp_path)
+
+    def duplicate_key(text):
+        return text.replace("{", '{"schema_version": 1,', 1)
+
+    hostile = _rewrite_manifest(
+        original.bundle_path, tmp_path / "duplicate-key.zip", duplicate_key
+    )
+
+    with pytest.raises(MapleBundleError) as error:
+        validate_maple_onnx_bundle(hostile)
+    assert "unambiguous JSON" in str(error.value)
+    assert "schema_version" not in str(error.value)
+
+
+def test_rejects_non_finite_manifest_number(tmp_path):
+    original = _valid_bundle(tmp_path)
+
+    def non_finite(text):
+        return text.replace('"schema_version": 1', '"schema_version": NaN', 1)
+
+    hostile = _rewrite_manifest(
+        original.bundle_path, tmp_path / "non-finite.zip", non_finite
+    )
+
+    with pytest.raises(MapleBundleError) as error:
+        validate_maple_onnx_bundle(hostile)
+    assert "unambiguous JSON" in str(error.value)
+    assert "NaN" not in str(error.value)
+
+
+def test_rejects_oversized_manifest(tmp_path):
+    original = _valid_bundle(tmp_path)
+
+    def oversized(text):
+        padding = "0" * (1024**2)
+        return text[:-1] + ', "padding": "' + padding + '"\n}'
+
+    hostile = _rewrite_manifest(
+        original.bundle_path, tmp_path / "oversized.zip", oversized
+    )
+
+    with pytest.raises(MapleBundleError) as error:
+        validate_maple_onnx_bundle(hostile)
+    assert "too large" in str(error.value)
+
+
+def test_rejects_unknown_runtime(tmp_path):
+    original = _valid_bundle(tmp_path)
+    hostile = _mutate_manifest(
+        original.bundle_path,
+        tmp_path / "runtime.zip",
+        lambda manifest: manifest.update(runtime="onnxruntime-desktop"),
+    )
+
+    with pytest.raises(MapleBundleError, match="runtime must be"):
+        validate_maple_onnx_bundle(hostile)
+
+
+def test_rejects_non_hex_checksum(tmp_path):
+    original = _valid_bundle(tmp_path)
+    hostile = _mutate_manifest(
+        original.bundle_path,
+        tmp_path / "checksum.zip",
+        lambda manifest: manifest["files"][0].update(sha256="z" * 64),
+    )
+
+    with pytest.raises(MapleBundleError, match="valid SHA-256"):
+        validate_maple_onnx_bundle(hostile)
+
+
+def test_rejects_short_source_revision(tmp_path):
+    original = _valid_bundle(tmp_path)
+    hostile = _mutate_manifest(
+        original.bundle_path,
+        tmp_path / "revision.zip",
+        lambda manifest: manifest.update(source_revision="abc123"),
+    )
+
+    with pytest.raises(MapleBundleError, match="immutable lowercase commit SHA"):
+        validate_maple_onnx_bundle(hostile)
